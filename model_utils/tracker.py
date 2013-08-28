@@ -52,6 +52,14 @@ class FieldInstanceTracker(object):
             if self.has_changed(field)
         )
 
+    def changelog(self):
+        """Returns dict of fields that changed since save (with old and new values)"""
+        return dict(
+            (field, (self.previous(field), self.get_field_value(field)))
+            for field in self.fields
+            if self.has_changed(field)
+        )
+
 
 class FieldTracker(object):
 
