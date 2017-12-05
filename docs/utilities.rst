@@ -15,7 +15,6 @@ Choices
 
     class Article(models.Model):
         STATUS = Choices('draft', 'published')
-        # ...
         status = models.CharField(choices=STATUS, default=STATUS.draft, max_length=20)
 
 A ``Choices`` object is initialized with any number of choices. In the
@@ -34,7 +33,6 @@ representation. In this case you can provide choices as two-tuples:
 
     class Article(models.Model):
         STATUS = Choices(('draft', _('draft')), ('published', _('published')))
-        # ...
         status = models.CharField(choices=STATUS, default=STATUS.draft, max_length=20)
 
 But what if your database representation of choices is constrained in
@@ -52,8 +50,26 @@ the third is the human-readable version:
 
     class Article(models.Model):
         STATUS = Choices((0, 'draft', _('draft')), (1, 'published', _('published')))
-        # ...
         status = models.IntegerField(choices=STATUS, default=STATUS.draft)
+
+You can index into a ``Choices`` instance to translate a database
+representation to its display name:
+
+.. code-block:: python
+
+    status_display = Article.STATUS[article.status]
+
+Option groups can also be used with ``Choices``; in that case each
+argument is a tuple consisting of the option group name and a list of
+options, where each option in the list is either a string, a two-tuple,
+or a triple as outlined above. For example:
+
+.. code-block:: python
+
+    from model_utils import Choices
+
+    class Article(models.Model):
+    STATUS = Choices(('Visible', ['new', 'archived']), ('Invisible', ['draft', 'deleted']))
 
 Choices can be concatenated with the ``+`` operator, both to other Choices
 instances and other iterable objects that could be converted into Choices:
@@ -66,7 +82,6 @@ instances and other iterable objects that could be converted into Choices:
 
     class Article(models.Model):
         STATUS = GENERIC_CHOICES + [(2, 'featured', _('featured'))]
-        # ...
         status = models.IntegerField(choices=STATUS, default=STATUS.draft)
 
 
@@ -138,7 +153,7 @@ Returns ``None`` when the model instance isn't saved yet.
 
 has_changed
 ~~~~~~~~~~~
-Returns ``True`` if the given field has changed since the last save:
+Returns ``True`` if the given field has changed since the last save. The ``has_changed`` method expects a single field:
 
 .. code-block:: pycon
 
@@ -195,3 +210,16 @@ An example using the model specified above:
     >>> a.body = 'First post!'
     >>> a.title_tracker.changed()
     {'title': None}
+
+
+Checking changes using signals
+------------------------------
+
+The field tracker methods may also be used in ``pre_save`` and ``post_save``
+signal handlers to identify field changes on model save.
+
+.. NOTE::
+
+    Due to the implementation of ``FieldTracker``, ``post_save`` signal
+    handlers relying on field tracker methods should only be registered after
+    model creation.

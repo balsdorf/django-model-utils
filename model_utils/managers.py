@@ -1,54 +1,120 @@
 from __future__ import unicode_literals
 import django
 from django.db import models
-from django.db.models.fields.related import OneToOneField
+from django.db.models.fields.related import OneToOneField, OneToOneRel
 from django.db.models.query import QuerySet
+try:
+    from django.db.models.query import BaseIterable, ModelIterable
+except ImportError:
+    # Django 1.8 does not have iterable classes
+    BaseIterable = object
 from django.core.exceptions import ObjectDoesNotExist
 
-try:
-    from django.db.models.constants import LOOKUP_SEP
-except ImportError: # Django < 1.5
-    from django.db.models.sql.constants import LOOKUP_SEP
+from django.db.models.constants import LOOKUP_SEP
+from django.utils.six import string_types
 
 
+class InheritanceIterable(BaseIterable):
+    def __iter__(self):
+        queryset = self.queryset
+        iter = ModelIterable(queryset)
+        if getattr(queryset, 'subclasses', False):
+            extras = tuple(queryset.query.extra.keys())
+            # sort the subclass names longest first,
+            # so with 'a' and 'a__b' it goes as deep as possible
+            subclasses = sorted(queryset.subclasses, key=len, reverse=True)
+            for obj in iter:
+                sub_obj = None
+                for s in subclasses:
+                    sub_obj = queryset._get_sub_obj_recurse(obj, s)
+                    if sub_obj:
+                        break
+                if not sub_obj:
+                    sub_obj = obj
 
-class InheritanceQuerySet(QuerySet):
+                if getattr(queryset, '_annotated', False):
+                    for k in queryset._annotated:
+                        setattr(sub_obj, k, getattr(obj, k))
+
+                for k in extras:
+                    setattr(sub_obj, k, getattr(obj, k))
+
+                yield sub_obj
+        else:
+            for obj in iter:
+                yield obj
+
+
+class InheritanceQuerySetMixin(object):
+    def __init__(self, *args, **kwargs):
+        super(InheritanceQuerySetMixin, self).__init__(*args, **kwargs)
+        if django.VERSION > (1, 8):
+            self._iterable_class = InheritanceIterable
+
     def select_subclasses(self, *subclasses):
+        levels = self._get_maximum_depth()
+        calculated_subclasses = self._get_subclasses_recurse(
+            self.model, levels=levels)
+        # if none were passed in, we can just short circuit and select all
         if not subclasses:
-            # only recurse one level on Django < 1.6 to avoid triggering
-            # https://code.djangoproject.com/ticket/16572
-            levels = None
-            if django.VERSION < (1, 6, 0):
-                levels = 1
-            subclasses = self._get_subclasses_recurse(self.model, levels=levels)
+            subclasses = calculated_subclasses
+        else:
+            verified_subclasses = []
+            for subclass in subclasses:
+                # special case for passing in the same model as the queryset
+                # is bound against. Rather than raise an error later, we know
+                # we can allow this through.
+                if subclass is self.model:
+                    continue
+
+                if not isinstance(subclass, string_types):
+                    subclass = self._get_ancestors_path(
+                        subclass, levels=levels)
+
+                if subclass in calculated_subclasses:
+                    verified_subclasses.append(subclass)
+                else:
+                    raise ValueError(
+                        '%r is not in the discovered subclasses, tried: %s' % (
+                            subclass, ', '.join(calculated_subclasses))
+                        )
+            subclasses = verified_subclasses
+
         # workaround https://code.djangoproject.com/ticket/16855
-        field_dict = self.query.select_related
+        previous_select_related = self.query.select_related
         new_qs = self.select_related(*subclasses)
-        if isinstance(new_qs.query.select_related, dict) and isinstance(field_dict, dict):
-            new_qs.query.select_related.update(field_dict)
+        previous_is_dict = isinstance(previous_select_related, dict)
+        new_is_dict = isinstance(new_qs.query.select_related, dict)
+        if previous_is_dict and new_is_dict:
+            new_qs.query.select_related.update(previous_select_related)
         new_qs.subclasses = subclasses
         return new_qs
-
 
     def _clone(self, klass=None, setup=False, **kwargs):
         for name in ['subclasses', '_annotated']:
             if hasattr(self, name):
                 kwargs[name] = getattr(self, name)
-        return super(InheritanceQuerySet, self)._clone(klass, setup, **kwargs)
-
+        if django.VERSION < (1, 9):
+            kwargs['klass'] = klass
+            kwargs['setup'] = setup
+        return super(InheritanceQuerySetMixin, self)._clone(**kwargs)
 
     def annotate(self, *args, **kwargs):
-        qset = super(InheritanceQuerySet, self).annotate(*args, **kwargs)
+        qset = super(InheritanceQuerySetMixin, self).annotate(*args, **kwargs)
         qset._annotated = [a.default_alias for a in args] + list(kwargs.keys())
         return qset
 
-
     def iterator(self):
-        iter = super(InheritanceQuerySet, self).iterator()
+        # Maintained for Django 1.8 compatability
+        iter = super(InheritanceQuerySetMixin, self).iterator()
         if getattr(self, 'subclasses', False):
+            extras = tuple(self.query.extra.keys())
+            # sort the subclass names longest first,
+            # so with 'a' and 'a__b' it goes as deep as possible
+            subclasses = sorted(self.subclasses, key=len, reverse=True)
             for obj in iter:
                 sub_obj = None
-                for s in self.subclasses:
+                for s in subclasses:
                     sub_obj = self._get_sub_obj_recurse(obj, s)
                     if sub_obj:
                         break
@@ -59,16 +125,34 @@ class InheritanceQuerySet(QuerySet):
                     for k in self._annotated:
                         setattr(sub_obj, k, getattr(obj, k))
 
+                for k in extras:
+                    setattr(sub_obj, k, getattr(obj, k))
+
                 yield sub_obj
         else:
             for obj in iter:
                 yield obj
 
-
     def _get_subclasses_recurse(self, model, levels=None):
-        rels = [rel for rel in model._meta.get_all_related_objects()
-                      if isinstance(rel.field, OneToOneField)
-                      and issubclass(rel.field.model, model)]
+        """
+        Given a Model class, find all related objects, exploring children
+        recursively, returning a `list` of strings representing the
+        relations for select_related
+        """
+        if django.VERSION < (1, 8):
+            related_objects = model._meta.get_all_related_objects()
+        else:
+            related_objects = [
+                f for f in model._meta.get_fields()
+                if isinstance(f, OneToOneRel)]
+
+        rels = [
+            rel for rel in related_objects
+            if isinstance(rel.field, OneToOneField)
+            and issubclass(rel.field.model, model)
+            and model is not rel.field.model
+            ]
+
         subclasses = []
         if levels:
             levels -= 1
@@ -76,13 +160,51 @@ class InheritanceQuerySet(QuerySet):
             if levels or levels is None:
                 for subclass in self._get_subclasses_recurse(
                         rel.field.model, levels=levels):
-                    subclasses.append(rel.var_name + LOOKUP_SEP + subclass)
-            subclasses.append(rel.var_name)
+                    subclasses.append(
+                        rel.get_accessor_name() + LOOKUP_SEP + subclass)
+            subclasses.append(rel.get_accessor_name())
         return subclasses
 
+    def _get_ancestors_path(self, model, levels=None):
+        """
+        Serves as an opposite to _get_subclasses_recurse, instead walking from
+        the Model class up the Model's ancestry and constructing the desired
+        select_related string backwards.
+        """
+        if not issubclass(model, self.model):
+            raise ValueError(
+                "%r is not a subclass of %r" % (model, self.model))
+
+        ancestry = []
+        # should be a OneToOneField or None
+        parent_link = model._meta.get_ancestor_link(self.model)
+        if levels:
+            levels -= 1
+        while parent_link is not None:
+            if django.VERSION < (1, 9):
+                related = parent_link.rel
+            else:
+                related = parent_link.remote_field
+            ancestry.insert(0, related.get_accessor_name())
+            if levels or levels is None:
+                if django.VERSION < (1, 8):
+                    parent_model = related.parent_model
+                else:
+                    parent_model = related.model
+                parent_link = parent_model._meta.get_ancestor_link(
+                    self.model)
+            else:
+                parent_link = None
+        return LOOKUP_SEP.join(ancestry)
 
     def _get_sub_obj_recurse(self, obj, s):
         rel, _, s = s.partition(LOOKUP_SEP)
+
+        # Django 1.9: If a primitive type gets passed to this recursive function,
+        # return None as non-models are not part of inheritance.
+        if not isinstance(obj, models.Model):
+            return None
+
         try:
             node = getattr(obj, rel)
         except ObjectDoesNotExist:
@@ -93,23 +215,44 @@ class InheritanceQuerySet(QuerySet):
         else:
             return node
 
+    def get_subclass(self, *args, **kwargs):
+        return self.select_subclasses().get(*args, **kwargs)
+
+    def _get_maximum_depth(self):
+        """
+        Under Django versions < 1.6, to avoid triggering
+        https://code.djangoproject.com/ticket/16572 we can only look
+        as far as children.
+        """
+        levels = None
+        if django.VERSION < (1, 6, 0):
+            levels = 1
+        return levels
 
 
-class InheritanceManager(models.Manager):
+class InheritanceQuerySet(InheritanceQuerySetMixin, QuerySet):
+    pass
+
+
+class InheritanceManagerMixin(object):
     use_for_related_fields = True
+    _queryset_class = InheritanceQuerySet
 
-    def get_query_set(self):
-        return InheritanceQuerySet(self.model)
+    def get_queryset(self):
+        return self._queryset_class(self.model)
 
     def select_subclasses(self, *subclasses):
-        return self.get_query_set().select_subclasses(*subclasses)
+        return self.get_queryset().select_subclasses(*subclasses)
 
     def get_subclass(self, *args, **kwargs):
-        return self.get_query_set().select_subclasses().get(*args, **kwargs)
+        return self.get_queryset().get_subclass(*args, **kwargs)
 
 
+class InheritanceManager(InheritanceManagerMixin, models.Manager):
+    pass
 
-class QueryManager(models.Manager):
+
+class QueryManagerMixin(object):
     use_for_related_fields = True
 
     def __init__(self, *args, **kwargs):
@@ -118,84 +261,58 @@ class QueryManager(models.Manager):
         else:
             self._q = models.Q(**kwargs)
         self._order_by = None
-        super(QueryManager, self).__init__()
+        super(QueryManagerMixin, self).__init__()
 
     def order_by(self, *args):
         self._order_by = args
         return self
 
-    def get_query_set(self):
-        qs = super(QueryManager, self).get_query_set().filter(self._q)
+    def get_queryset(self):
+        qs = super(QueryManagerMixin, self).get_queryset().filter(self._q)
         if self._order_by is not None:
             return qs.order_by(*self._order_by)
         return qs
 
 
-class PassThroughManager(models.Manager):
+class QueryManager(QueryManagerMixin, models.Manager):
+    pass
+
+
+class SoftDeletableQuerySetMixin(object):
     """
-    Inherit from this Manager to enable you to call any methods from your
-    custom QuerySet class from your manager. Simply define your QuerySet
-    class, and return an instance of it from your manager's `get_query_set`
-    method.
-
-    Alternately, if you don't need any extra methods on your manager that
-    aren't on your QuerySet, then just pass your QuerySet class to the
-    ``for_queryset_class`` class method.
-
-    class PostQuerySet(QuerySet):
-        def enabled(self):
-            return self.filter(disabled=False)
-
-    class Post(models.Model):
-        objects = PassThroughManager.for_queryset_class(PostQuerySet)()
-
+    QuerySet for SoftDeletableModel. Instead of removing instance sets
+    its ``is_removed`` field to True.
     """
-    # pickling causes recursion errors
-    _deny_methods = ['__getstate__', '__setstate__', '__getinitargs__',
-                     '__getnewargs__', '__copy__', '__deepcopy__', '_db']
 
-    def __init__(self, queryset_cls=None):
-        self._queryset_cls = queryset_cls
-        super(PassThroughManager, self).__init__()
-
-    def __getattr__(self, name):
-        if name in self._deny_methods:
-            raise AttributeError(name)
-        return getattr(self.get_query_set(), name)
-
-    def get_query_set(self):
-        qs = super(PassThroughManager, self).get_query_set()
-        if self._queryset_cls is not None:
-            qs = qs._clone(klass=self._queryset_cls)
-        return qs
-
-    @classmethod
-    def for_queryset_class(cls, queryset_cls):
-        return create_pass_through_manager_for_queryset_class(cls, queryset_cls)
+    def delete(self):
+        """
+        Soft delete objects from queryset (set their ``is_removed``
+        field to True)
+        """
+        self.update(is_removed=True)
 
 
-def create_pass_through_manager_for_queryset_class(base, queryset_cls):
-    class _PassThroughManager(base):
-        def __init__(self):
-            return super(_PassThroughManager, self).__init__()
-
-        def get_query_set(self):
-            qs = super(_PassThroughManager, self).get_query_set()
-            return qs._clone(klass=queryset_cls)
-
-        def __reduce__(self):
-            # our pickling support breaks for subclasses (e.g. RelatedManager)
-            if self.__class__ is not _PassThroughManager:
-                return super(_PassThroughManager, self).__reduce__()
-            return (
-                unpickle_pass_through_manager_for_queryset_class,
-                (base, queryset_cls),
-                self.__dict__,
-                )
-
-    return _PassThroughManager
+class SoftDeletableQuerySet(SoftDeletableQuerySetMixin, QuerySet):
+    pass
 
 
-def unpickle_pass_through_manager_for_queryset_class(base, queryset_cls):
-    cls = create_pass_through_manager_for_queryset_class(base, queryset_cls)
-    return cls.__new__(cls)
+class SoftDeletableManagerMixin(object):
+    """
+    Manager that limits the queryset by default to show only not removed
+    instances of model.
+    """
+    _queryset_class = SoftDeletableQuerySet
+
+    def get_queryset(self):
+        """
+        Return queryset limited to not removed entries.
+        """
+        kwargs = {'model': self.model, 'using': self._db}
+        if hasattr(self, '_hints'):
+            kwargs['hints'] = self._hints
+
+        return self._queryset_class(**kwargs).filter(is_removed=False)
+
+
+class SoftDeletableManager(SoftDeletableManagerMixin, models.Manager):
+    pass

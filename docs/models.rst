@@ -10,6 +10,13 @@ manager that returns only objects for whom the current date-time lies
 within their time range.
 
 
+TimeStampedModel
+----------------
+
+This abstract base class just provides self-updating ``created`` and
+``modified`` fields on any model that inherits from it.
+
+
 StatusModel
 -----------
 
@@ -40,3 +47,11 @@ returns objects with that status only:
 
     # this query will only return published articles:
     Article.published.all()
+
+
+SoftDeletableModel
+------------------
+
+This abstract base class just provides field ``is_removed`` which is
+set to True instead of removing the instance. Entities returned in
+default manager are limited to not-deleted instances.

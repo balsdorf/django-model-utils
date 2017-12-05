@@ -1,9 +1,12 @@
 from __future__ import unicode_literals
 
+import django
 from django.db import models
 from django.conf import settings
 from django.utils.encoding import python_2_unicode_compatible
 from django.utils.timezone import now
+
+DEFAULT_CHOICES_NAME = 'STATUS'
 
 
 class AutoCreatedField(models.DateTimeField):
@@ -48,16 +51,19 @@ class StatusField(models.CharField):
     def __init__(self, *args, **kwargs):
         kwargs.setdefault('max_length', 100)
         self.check_for_status = not kwargs.pop('no_check_for_status', False)
+        self.choices_name = kwargs.pop('choices_name', DEFAULT_CHOICES_NAME)
         super(StatusField, self).__init__(*args, **kwargs)
 
     def prepare_class(self, sender, **kwargs):
         if not sender._meta.abstract and self.check_for_status:
-            assert hasattr(sender, 'STATUS'), \
-                "To use StatusField, the model '%s' must have a STATUS choices class attribute." \
-                % sender.__name__
-            self._choices = sender.STATUS
+            assert hasattr(sender, self.choices_name), \
+                "To use StatusField, the model '%s' must have a %s choices class attribute." \
+                % (sender.__name__, self.choices_name)
+            self._choices = getattr(sender, self.choices_name)
+            if django.VERSION >= (1, 9, 0):
+                self.choices = self._choices
             if not self.has_default():
-                self.default = tuple(sender.STATUS)[0][0]  # set first as default
+                self.default = tuple(getattr(sender, self.choices_name))[0][0]  # set first as default
 
     def contribute_to_class(self, cls, name):
         models.signals.class_prepared.connect(self.prepare_class, sender=cls)
@@ -65,7 +71,14 @@ class StatusField(models.CharField):
         # the STATUS class attr being available), but we need to set some dummy
         # choices now so the super method will add the get_FOO_display method
         self._choices = [(0, 'dummy')]
+        if django.VERSION >= (1, 9, 0):
+            self.choices = self._choices
         super(StatusField, self).contribute_to_class(cls, name)
+
+    def deconstruct(self):
+        name, path, args, kwargs = super(StatusField, self).deconstruct()
+        kwargs['no_check_for_status'] = True
+        return name, path, args, kwargs
 
 
 class MonitorField(models.DateTimeField):
@@ -82,6 +95,10 @@ class MonitorField(models.DateTimeField):
             raise TypeError(
                 '%s requires a "monitor" argument' % self.__class__.__name__)
         self.monitor = monitor
+        when = kwargs.pop('when', None)
+        if when is not None:
+            when = set(when)
+        self.when = when
         super(MonitorField, self).__init__(*args, **kwargs)
 
     def contribute_to_class(self, cls, name):
@@ -93,6 +110,9 @@ class MonitorField(models.DateTimeField):
         return getattr(instance, self.monitor)
 
     def _save_initial(self, sender, instance, **kwargs):
+        if django.VERSION >= (1, 10) and self.monitor in instance.get_deferred_fields():
+            # Fix related to issue #241 to avoid recursive error on double monitor fields
+            return
         setattr(instance, self.monitor_attname,
                 self.get_monitored_value(instance))
 
@@ -101,9 +121,17 @@ class MonitorField(models.DateTimeField):
         previous = getattr(model_instance, self.monitor_attname, None)
         current = self.get_monitored_value(model_instance)
         if previous != current:
-            setattr(model_instance, self.attname, value)
-            self._save_initial(model_instance.__class__, model_instance)
+            if self.when is None or current in self.when:
+                setattr(model_instance, self.attname, value)
+                self._save_initial(model_instance.__class__, model_instance)
         return super(MonitorField, self).pre_save(model_instance, add)
+
+    def deconstruct(self):
+        name, path, args, kwargs = super(MonitorField, self).deconstruct()
+        kwargs['monitor'] = self.monitor
+        if self.when is not None:
+            kwargs['when'] = self.when
+        return name, path, args, kwargs
 
 
 SPLIT_MARKER = getattr(settings, 'SPLIT_MARKER', '<!-- split -->')
@@ -200,7 +228,7 @@ class SplitField(models.TextField):
         return value.content
 
     def value_to_string(self, obj):
-        value = self._get_val_from_obj(obj)
+        value = self.value_from_object(obj)
         return value.content
 
     def get_prep_value(self, value):
@@ -209,30 +237,7 @@ class SplitField(models.TextField):
         except AttributeError:
             return value
 
-
-# allow South to handle these fields smoothly
-try:
-    from south.modelsinspector import add_introspection_rules
-    # For a normal MarkupField, the add_excerpt_field attribute is
-    # always True, which means no_excerpt_field arg will always be
-    # True in a frozen MarkupField, which is what we want.
-    add_introspection_rules(rules=[
-        (
-            (SplitField,),
-            [],
-            {'no_excerpt_field': ('add_excerpt_field', {})}
-        ),
-        (
-            (MonitorField,),
-            [],
-            {'monitor': ('monitor', {})}
-        ),
-        (
-            (StatusField,),
-            [],
-            {'no_check_for_status': ('check_for_status', {})}
-        ),
-    ], patterns=['model_utils\.fields\.'])
-except ImportError:
-    pass
-
+    def deconstruct(self):
+        name, path, args, kwargs = super(SplitField, self).deconstruct()
+        kwargs['no_excerpt_field'] = True
+        return name, path, args, kwargs
